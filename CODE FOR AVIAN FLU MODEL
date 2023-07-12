@@ -1,0 +1,570 @@
+rm(list = ls(all=TRUE))
+###loading libraries
+library(rpart)
+library(dplyr)
+library(lubridate)
+library(readxl)
+library(openxlsx)
+library(tidyquant)
+library(caret)
+library(ggplot2)
+library(pROC)
+library(rpart.plot)
+library(usmap)
+library(datasets)
+library(geosphere)
+library(smotefamily)
+library(nnet)
+library(randomForest)
+library(e1071)
+library(class)
+library(gbm)
+library(RSBID)
+library(xgboost)
+library(pROC)
+library(smallstuff)
+
+
+
+
+######## Combining Datasets ###############
+
+#Dataset 1
+#Loading the US Counties Data set and manipulating the contents to match with other Datasets
+county <- read_xlsx("USCOUNTIES_NEW.xlsx")
+colnames(county)[4] <- "FIPS"
+county$county_ascii <- paste(county$county_ascii, "County", sep = " ")
+county$county_ascii <- paste(county$county_ascii, county$state_name, sep = " ")
+county <- county[,-c(1)]
+
+
+#Creating Month_Index column and county combination dataset for all counties and months from January 2022 to May 2023
+month_indexes <- 1:17
+county_months <- expand.grid(county_ascii = unique(county$county_ascii), month_index = month_indexes)
+county_months
+
+
+# Merge the US County Data set with the county-month combinations
+merged_data <- merge(county, county_months, by = "county_ascii", all = TRUE)
+colnames(county)[1] <- "Location"
+colnames(merged_data)[9] <- "Month_Index"
+colnames(merged_data)[1] <- "Location"
+
+
+
+
+#Dataset 2
+#Loading the Wild Birds Data set and manipulating the contents to match with other Datasets
+wb <- read_xlsx("Wildbirds_new.xlsx")
+wb <- wb[, -c(4,5,7,8)]
+wb$FlockSize <- 1
+colnames(wb)[4] <- "Classification"
+colnames(wb)[3] <- "Outbreak Date"
+colnames(wb)[2] <- "Location"
+colnames(wb)[5] <- "affected_birds"
+wb$Location <- paste(wb$Location, "County", sep = " ")
+wb$Location <- paste(wb$Location, wb$State, sep = " ")
+
+
+#Adding FIPS number from by matching with US county dataset
+index <- match(wb$Location, county$Location)
+index
+wb$FIPS <- county$FIPS[index]
+wb
+
+#Adding values for month index
+wb <- wb %>%
+  mutate(`Outbreak Date` = mdy(`Outbreak Date`),  # Convert the date column to a proper Date object
+         Month_Index = (year(`Outbreak Date`) - 2022) * 12 + month(`Outbreak Date`))  # Calculate the month index
+
+#Aggregating values on Month index, county and classification of birds
+wb_aggregated<- wb %>%
+  group_by(Month_Index, Location, Classification) %>%
+  summarize(State = first(State), FIPS = first(FIPS),
+            affected_birds = sum(affected_birds), .groups = "drop")
+View(wb_aggregated)
+
+
+
+
+##### Dataset 3
+#Loading the Poultry Data set and manipulating the contents to match with other Datasets
+po <- read_xlsx("Poultry_new.xlsx")
+colnames(po)[4] <- "Classification"
+colnames(po)[1] <- "Location"
+colnames(po)[5] <- "affected_birds"
+po$Location <- paste(po$Location, "County", sep = " ")
+po$Location <- paste(po$Location, po$State, sep = " ")
+
+
+###Adding FIPS number from US county dataset
+index <- match(po$Location, county$Location)
+index
+po$FIPS <- county$FIPS[index]
+
+
+###Adding Month Index
+po <- po %>%
+  mutate(`Outbreak Date` = mdy(`Outbreak Date`),  # Convert the date column to a proper Date object
+         Month_Index = (year(`Outbreak Date`) - 2022) * 12 + month(`Outbreak Date`))  # Calculate the month index
+
+###Aggregating values on month index, county and classification
+po_aggregated <- po %>%
+  group_by(Month_Index, Location,Classification) %>%
+  summarize(State = first(State), FIPS = first(FIPS),
+            affected_birds = sum(affected_birds), .groups = "drop")
+
+
+#Merging Poultry and Wildbird dataset po and wb
+combined <- rbind(wb_aggregated,po_aggregated)
+
+
+#Dataset 4 
+#Loading the Weather Data set and manipulating the contents to match with other Datasets
+county$county_full <- paste(county$county_full, county$state_name, sep = " ")
+weather <- read_xlsx("Updatethis.xlsx")
+weather$state_name <- state.name[match(weather$State, state.abb)]
+for (i in 1:nrow(weather)) {
+  if (weather[i, 1] == 'DC-1') {
+    weather[i, 7] <- 'District of Columbia'
+  }
+}
+weather$Location <- paste(weather$Location, weather$state_name, sep = " ")
+
+
+###Adding FIPS number from US county dataset
+index <- match(weather$Location, county$county_full)
+index
+weather$FIPS <- county$FIPS[index]
+colnames(weather)[2] <- "Location_1" 
+
+
+#Merging Datasets
+final <- merge(merged_data, combined, by = c("FIPS","Month_Index","Location"), all = TRUE)
+final$county_full <- paste(final$county_full, final$state_name, sep = " ")
+colnames(final)[4] <- "Location_1"
+final1 <- merge(final, weather, by = c("FIPS", "Location_1","Month_Index"), all = TRUE, suffixes = c("", ".y"))
+final1 <- final1[,-c(4,11,13,14,17)]
+
+#Creating the Decision variable Outbreak on the basis of affected_birds column
+final1[is.na(final1)] <- 0
+final1$Outbreak <-0
+final1$Outbreak <- ifelse(final1$affected_birds > 0, 1,0)
+colnames(final1)[2] <- "Location"
+
+
+
+#Loading the Spatial Prevalence Data set and manipulating the contents to match with other Datasets
+aggregated_spatial <- read_xlsx("Spatial_1.xlsx")
+aggregated_spatial$Location <- paste(aggregated_spatial$Location, aggregated_spatial$state_name, sep = " ")
+
+###Adding FIPS number from US county dataset
+index <- match(aggregated_spatial$Location, county$county_full)
+index
+aggregated_spatial$FIPS <- county$FIPS[index]
+
+#Adding Months 13 to 17 in the Spatial Prevalence Dataset
+expand_dataset <- function(data) {
+  expanded_data <- data
+  unique_counties <- unique(data$Location)
+  new_month_indices <- 13:17
+  
+  for (county in unique_counties) {
+    county_data <- subset(data, Location == county)
+    county_data_subset <- subset(county_data, Month_Index %in% 1:5)
+    
+    for (i in 1:length(new_month_indices)) {
+      new_row <- county_data_subset[i, ]
+      new_row$Month_Index <- new_month_indices[i]
+      expanded_data <- rbind(expanded_data, new_row)
+    }
+  }
+  
+  return(expanded_data)
+}
+
+expanded_data <- expand_dataset(aggregated_spatial)
+
+
+#Merging Spatial Dataset with the above aggregated dataset and moving a few column locations
+
+final2 <- merge(final1, expanded_data, by = c("FIPS", "Location","Month_Index"), all = TRUE, suffixes = c("", ".y"))
+final2 <- final2[,-c(4,16)]
+final2 <- final2[, c(1:2, 13, (2 + 1):ncol(final2))]
+final2 <- final2[,-c(14)]
+final2 <- final2[, c(1:2, 5, (2 + 1):ncol(final2))]
+final2 <- final2[,-c(6)]
+final2 <- final2[, c(1:12, 14, (13):ncol(final2))]
+final2 <- final2[,-c(15)]
+
+
+# Remove rows containing Hawaii, as data on it was missing for some of the Variables.
+final2<-final2[!(final2$FIPS=="2016" | final2$FIPS=="15001"),]
+
+final2<-final2[!(final2$FIPS=="15003" | final2$FIPS=="15005"),]
+final2<-final2[!(final2$FIPS=="15007" | final2$FIPS=="15009"),]
+
+
+
+
+##############Creating New Variables############
+
+#Loading the precalculated decision matrix. The code for making the matrix is at the end of the main code
+load("matrix.RData")
+
+
+#Adding the lastmonth_Outbreak Variable
+final2$lastmonth_Outbreak <- 0
+for (i in 1:nrow(final2)) {
+  current_county <- final2[i, ]
+  
+  # Check if the county itself had an outbreak in the previous month
+  prior_month_outbreak <- final2$Outbreak[final2$Location == current_county$Location & final2$Month_Index == (current_county$Month_Index - 1)]
+  
+  # Assign the outbreak value to Proximity if the county had an outbreak in the previous month
+  if (any(prior_month_outbreak %in% c(1,2))) {
+    final2$lastmonth_Outbreak[i] <- max(prior_month_outbreak)
+  }
+}
+
+
+
+#Adding the Proximity_ISL variable based upon the Inverse Square Law
+final2$Proximity_ISL <- 0
+for (i in 1:nrow(final2)) {
+  current_county <- final2[i, ]
+  
+  # Check if any county within a 400 km radius had an outbreak in the previous month (excluding the county itself)
+  distance_row <- distance_matrix[rownames(distance_matrix) == current_county$Location, ]
+  nearby_counties <- rownames(distance_matrix)[distance_row <= 400 & rownames(distance_matrix) != current_county$Location]
+  prior_month_radius_outbreak <- (final2$Outbreak[final2$Location %in% nearby_counties & final2$Month_Index == (current_county$Month_Index - 1)])
+  
+  # Calculate the sum of outbreak values within the given distance for the previous month using inverse square law
+  prior_month_radius_outbreak_sum <- sum(1 / distance_matrix[current_county$Location, nearby_counties]^2 * prior_month_radius_outbreak)
+  
+  # Assign the calculated sum as the Proximity1 value
+  final2$Proximity_ISL[i] <- prior_month_radius_outbreak_sum
+}
+
+
+
+#Adding Season Variable
+conditions <- list(
+  final2$Month_Index %in% c(3, 4, 5, 15, 16, 17),  # Spring
+  final2$Month_Index %in% c(1, 2, 12,13,14),            # Winter
+  final2$Month_Index %in% c(6, 7, 8),             # Summer
+  final2$Month_Index %in% c(9, 10, 11)            # Autumn
+)
+
+seasons <- c("Spring", "Winter", "Summer", "Autumn")
+
+final2$season <- NA
+for (i in 1:length(conditions)) {
+  final2$season[conditions[[i]]] <- seasons[i]
+}
+
+final2$Spring <- ifelse(final2$season == 'Spring', 1, 0)
+final2$Winter <- ifelse(final2$season == 'Winter', 1, 0)
+final2$Summer <- ifelse(final2$season == 'Summer', 1, 0)
+final2 <- final2[, c(1:11, (12:13),15:20, 14)]
+final2 <- final2[,-c(16)]
+final3 <- final2[,-c(2,3,4,9,10)]
+
+
+
+
+
+
+###### Modelling####################
+set.seed(123)
+###division into train and test set
+final3$Outbreak <- as.factor(final3$Outbreak)
+final3$Summer <- as.factor(final3$Summer)
+final3$Winter <- as.factor(final3$Winter)
+final3$Spring <- as.factor(final3$Spring)
+final3$lastmonth_Outbreak <- as.factor(final3$lastmonth_Outbreak)
+
+train_data_wo <- final3[final3$Month_Index < 13, ]
+test_data_wo <- final3[final3$Month_Index >= 13, ]
+
+
+#Logistic Regression without Oversampling
+
+logistic_model_wo <- glm(Outbreak ~ Month_Index + lat + population + avg_temp + lastmonth_Outbreak + Proximity_ISL +Prevalence + Summer + Spring, data = train_data_wo, family = binomial)
+summary(logistic_model_wo)
+
+predictions_wo_p <- predict(logistic_model_wo, test_data_wo, type = "response")
+predictions_wo_p
+predictions_wo <- ifelse(predictions_wo_p > 0.5, 1, 0)
+predictions_wo <- as.factor(predictions_wo)
+test_data_wo$Outbreak <- as.factor(test_data_wo$Outbreak)
+confusion_glm_wo <- confusionMatrix(data = predictions_wo, reference = test_data_wo$Outbreak, positive = "1", mode = "everything")
+confusion_glm_wo
+
+plot(roc(test_data_wo$Outbreak, as.numeric(predictions_wo_p)), print.auc =1, print.roc = 1, auc.polygon = TRUE, main = "ROC-Curve Logistic Regression")
+
+
+
+
+#Oversampling using SMOTE
+final4 <- final3
+str(final4)
+final4$Outbreak <- as.factor(final4$Outbreak)
+final4$Summer <- as.factor(final4$Summer)
+final4$Winter <- as.factor(final4$Winter)
+final4$Spring <- as.factor(final4$Spring)
+final4$lastmonth_Outbreak <- as.factor(final4$lastmonth_Outbreak)
+
+set.seed(123)
+oversampled_data <- SMOTE_NC(final4, "Outbreak", perc_maj = 45, k = 4)
+os <-  oversampled_data
+os<- os[,-1]
+counttt <- sum(final4$Outbreak ==1)
+
+#Diving the data into train and test set
+train_data_os <- os[os$Month_Index < 13, ]
+test_data_os <- os[os$Month_Index >= 13, ]
+
+
+
+
+#Logistic Regression with Oversampling
+
+logistic_model_os <- glm(Outbreak ~ Month_Index + lat + population +avg_temp + lastmonth_Outbreak + Proximity_ISL +Prevalence + Summer + Winter + Spring, data = train_data_os, family = binomial(link = "logit"))
+predictions_glm <- predict(logistic_model_os, test_data_os, type = "response")
+predictions_glm
+predictions_glm_class <- ifelse(predictions_glm> 0.872, 1, 0)
+
+test_data_os$Outbreak <- as.factor(test_data_os$Outbreak)
+predictions_glm_class <- as.factor(predictions_glm_class)
+predictions_glm_class
+confusion_glm <- confusionMatrix(data = predictions_glm_class, reference = test_data_os$Outbreak, positive = "1", mode = "everything")
+confusion_glm
+
+plot(roc(test_data_os$Outbreak, as.numeric(predictions_glm)), print.auc =1, print.roc = 1, auc.polygon = TRUE, main = "Logistic Regression with Oversampling")
+
+
+
+
+#SVM with oversampling
+
+svm_model <- svm(Outbreak ~Month_Index + lat + population  + avg_prcp +avg_temp + lastmonth_Outbreak + Proximity_ISL +Prevalence + Summer + Spring + Winter , data = train_data_os, kernel = "radial", probability = TRUE, cost = 0.0012)
+predictions_svm <- predict(svm_model, test_data_os, type = "response", probability = TRUE)
+predictions_svm_1 <-attributes(predictions_svm)$probabilities
+predictions_svm_1 <- predictions_svm_1[,2]
+
+predictions_svm_prob_class <- ifelse(predictions_svm_1> 0.843, 1, 0)
+predictions_svm_prob_class
+confusion_svm <- confusionMatrix(data = as.factor(predictions_svm_prob_class), reference = as.factor(test_data_os$Outbreak), positive = "1", mode="everything")
+confusion_svm
+
+plot(roc(test_data_os$Outbreak, as.numeric(predictions_svm_1)), print.auc =1, print.roc = 1, auc.polygon = TRUE, main = "ROC-Curve SVM")
+
+
+#Decision Trees with oversampling
+set.seed(123)
+decision_tree <- rpart(Outbreak ~ Month_Index + lat + population  + avg_temp+ avg_prcp + lastmonth_Outbreak + Proximity_ISL +Prevalence +Summer + Winter + Spring, data = train_data_os, method = "class")
+printcp(decision_tree)
+plotcp(decision_tree)
+predictions <- predict(decision_tree, test_data_os, type = "prob")
+predictions
+pred.DT <- ifelse(predictions[,2] > 0.7, "1", "0")
+pred.DT
+confusion_dt <- confusionMatrix(data = as.factor(pred.DT), reference = test_data_os$Outbreak, positive = "1")
+confusion_dt
+plot(roc(test_data_os$Outbreak, as.numeric(predictions[,2])), print.auc =1, print.roc = 1, auc.polygon = TRUE, main = "ROC-Curve Decision Tree")
+rpart.plot(decision_tree)
+p <- prune(decision_tree, cp = 0.025)
+p
+predictions_p <- predict(p, test_data_os, type = "prob")
+predictions_p
+pred.DT_1 <- ifelse(predictions_p[,2] > 0.25, "1", "0")
+pred.DT_1
+confusion_dt_p <- confusionMatrix(data = as.factor(pred.DT_1), reference = test_data_os$Outbreak, positive = "1", mode = "everything")
+confusion_dt_p
+plot(roc(test_data_os$Outbreak, as.numeric(predictions_p[,2])), print.auc =1, print.roc = 1, auc.polygon = TRUE, main = "Decision Tree - Pruned")
+count <- sum(train_data_os$Outbreak==0)
+rpart.plot((p), extra =0, type =2, digits = 2, yesno =2, clip.right.labs = FALSE, branch = .3)
+#KNN with Oversampling
+k <-3 # Number of neighbors to consider
+str(train_data_os)
+train_data_os$Outbreak <- as.numeric(train_data_os$Outbreak) -1
+train_data_os$Summer <- as.numeric(train_data_os$Summer) -1
+train_data_os$Winter <- as.numeric(train_data_os$Winter) -1
+train_data_os$Spring <- as.numeric(train_data_os$Spring) -1
+train_data_os$lastmonth_Outbreak <- as.numeric(train_data_os$lastmonth_Outbreak) -1
+test_data_os$Outbreak <- as.numeric(test_data_os$Outbreak) -1
+test_data_os$Summer <- as.numeric(test_data_os$Summer) -1
+test_data_os$Winter <- as.numeric(test_data_os$Winter) -1
+test_data_os$Spring <- as.numeric(test_data_os$Spring) -1
+test_data_os$lastmonth_Outbreak <- as.numeric(test_data_os$lastmonth_Outbreak) -1
+
+knn_model <- knn(train = train_data_os, test = test_data_os, cl = train_data_os$Outbreak, k = k, prob = TRUE)
+summary(knn_model)
+confusion_knn <- confusionMatrix(data = knn_model, reference = as.factor(test_data_os$Outbreak), positive = "1", mode = "everything")
+confusion_knn
+roc_knn<-ROCknn(knn_model, test_data_os$Outbreak)
+
+#Gradient Boosting with oversampling
+model_gbm = gbm(Outbreak ~Month_Index + lat +lng + population  + avg_prcp +avg_temp + lastmonth_Outbreak + Proximity_ISL +Prevalence,+Spring +Summer + Winter,
+                data = train_data_os,
+                cv.folds = 1,
+                shrinkage = 0.005,
+                distribution = "bernoulli",
+                n.trees = 650)       
+summary.gbm(model_gbm)
+predictions_gbm <- predict(model_gbm, newdata = test_data_os, type = "response")
+predictions_gbm
+predicted_labels <- ifelse(predictions_gbm > 0.52, 1, 0)
+predicted_labels <-as.factor(predicted_labels)
+predicted_labels
+confusion_gbm <- confusionMatrix(data = predicted_labels, reference = as.factor(test_data_os$Outbreak), positive = "1", mode="everything")
+confusion_gbm
+plot(roc(test_data_os$Outbreak, predictions_gbm), print.auc =1, print.roc = 1, auc.polygon = TRUE, main = "ROC-Curve GBM")
+
+
+#XGBOOST with oversampling
+
+train_data_os_xg <- train_data_os[,1:12]
+train_label <- (train_data_os[-c(1:12)])
+
+dtrain = xgb.DMatrix(as.matrix(train_data_os_xg), label=as.matrix(train_label))
+
+
+test_data_os_xg <- test_data_os[,1:12]
+test_label <- test_data_os[-c(1:12)]
+
+
+dtest = xgb.DMatrix(as.matrix(test_data_os_xg), label=as.matrix(test_label))
+
+
+
+xgb_model <- xgboost(data = dtrain, # the data   
+                     nround = 2,
+                     max.depth =3,
+                     objective = "binary:logistic")  # the objective function
+
+
+pred_xgb <- predict(xgb_model, dtest)
+
+predicted_labels_xgb <- ifelse(pred_xgb > 0.48, 1, 0)
+predicted_labels_xgb <- as.data.frame(predicted_labels_xgb)
+predicted_labels_xgb$predicted_labels_xgb <- as.factor(predicted_labels_xgb$predicted_labels_xgb)
+
+confusion_xgb <- confusionMatrix(data = predicted_labels_xgb$predicted_labels_xgb, reference = as.factor(test_label$Outbreak), positive = "1", mode="everything")
+confusion_xgb
+plot(roc(test_data_os$Outbreak, pred_xgb), print.auc =1, print.roc = 1, auc.polygon = TRUE, main = "ROC-Curve XGBOOST")
+importance_matrix = xgb.importance(colnames(train_data_os[,1:12]), model = xgb_model)
+importance_matrix
+#Bagging
+
+###averaging
+bagging <-(pred_xgb+predictions_gbm+predictions_p[,2])/3
+bagging
+bagging_class <- ifelse(bagging > 0.424, 1, 0)
+bagging_class
+bagging_conf<- confusionMatrix(data = as.factor(bagging_class), reference = as.factor(test_data_os$Outbreak), positive = "1", mode = "everything")
+bagging_conf
+plot(roc(test_data_os$Outbreak, as.numeric(bagging)), print.auc =1, print.thres = TRUE,print.roc = 1, auc.polygon = TRUE, main="ROC-Curve Bagging")
+
+
+
+
+
+###Plotting Graph
+
+
+# Compute the ROC curves and AUC values
+roc_xgb <- roc(test_data_os$Outbreak, pred_xgb)
+roc_bagging <- roc(test_data_os$Outbreak, as.numeric(bagging))
+roc_gbm <- roc(test_data_os$Outbreak, predictions_gbm)
+roc_dt <- roc(test_data_os$Outbreak, as.numeric(predictions_p[,2]))
+roc_svm <- roc(test_data_os$Outbreak, as.numeric(predictions_svm_1))
+roc_glm <- roc(test_data_os$Outbreak, as.numeric(predictions_glm))
+
+# Create a new plot with the first ROC curve
+plot(roc_bagging, print.auc = TRUE, auc.polygon = TRUE, main = "ROC Curves")
+# Add the remaining ROC curves to the plot
+lines(roc_xgb, col = "red")
+lines(roc_gbm, col = "green")
+lines(roc_dt, col = "orange")
+lines(roc_svm, col = "purple")
+lines(roc_glm, col = "brown")
+
+legend_text <- c(paste0("Bagging (AUC = ",round(auc(roc_bagging), 2), ")"),
+                 paste0("XGBOOST (AUC = ", round(auc(roc_xgb), 2), ")"),
+                 paste0("GBM (AUC = ", round(auc(roc_gbm), 2), ")"),
+                 paste0("Decision Tree (AUC = ", round(auc(roc_dt), 2), ")"),
+                 paste0("SVM (AUC = ", round(auc(roc_svm), 2), ")"),
+                 paste0("Logistic Regression (AUC = ", round(auc(roc_glm), 2), ")"))
+# Add a legend to the plot outside of the plot area
+legend("right", legend = legend_text,
+       col = c("black", "red", "green", "blue", "orange", "purple", "brown"), lty = 1, bty = "n", xjust = 0.5, yjust = 0.5)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+###WARNING WARNING WARNING WARNING######
+
+
+
+####Extra code to create the distance_matrix dataset. NOT TO BE RUN WITH THE MAIN CODE.
+
+#######Haverstine Distance
+haversine_distance <- function(lat1, lon1, lat2, lon2) {
+# Convert decimal degrees to radians
+  lon1 <- lon1 * (pi / 180)
+  lat1 <- lat1 * (pi / 180)
+  lon2 <- lon2 * (pi / 180)
+  lat2 <- lat2 * (pi / 180)
+  
+# Haversine formula
+  dlon <- lon2 - lon1
+  dlat <- lat2 - lat1
+  a <- sin(dlat / 2)^2 + cos(lat1) * cos(lat2) * sin(dlon / 2)^2
+  c <- 2 * atan2(sqrt(a), sqrt(1 - a))
+  distance <- 6371 * c  # Radius of the Earth in kilometers
+  return(distance)
+}
+
+create_distance_matrix <- function(county_data) {
+  unique_counties <- unique(county_data$Location)
+  num_counties <- length(unique_counties)
+  distance_matrix <- matrix(0, nrow = num_counties, ncol = num_counties)
+  
+  for (i in 1:num_counties) {
+    for (j in 1:num_counties) {
+      if (i == j) {
+        next
+      }
+      county_i <- unique_counties[i]
+      county_j <- unique_counties[j]
+      lat1 <- county_data$lat[county_data$Location == county_i]
+      lon1 <- county_data$lng[county_data$Location == county_i]
+      lat2 <- county_data$lat[county_data$Location == county_j]
+      lon2 <- county_data$lng[county_data$Location == county_j]
+      distance <- haversine_distance(lat1, lon1, lat2, lon2)
+      distance_matrix[i, j] <- distance[1]
+    }
+  }
+  
+  colnames(distance_matrix) <- unique_counties
+  rownames(distance_matrix) <- unique_counties
+  
+  return(distance_matrix)
+}
